@@ -3,6 +3,7 @@ import pkg from "upstox-js-sdk";
 const { UserApi, MarketQuoteApi } = pkg;
 import axios from "axios";
 import { Token } from "../models/tokenModel.js"; 
+import { initUpstoxLiveData } from "../services/liveDataService.js";
 
 export const login = (req, res) => {
   try {
@@ -64,11 +65,26 @@ export const callback = async (req, res) => {
     // 3. Set in process memory for other services
     process.env.UPSTOX_ACCESS_TOKEN = accessToken;
 
+    // 4. Start live data service
+    try {
+      await initUpstoxLiveData();
+      console.log("📈 Upstox WebSocket started dynamically.");
+    } catch (err) {
+      console.error("❌ Failed to start live data:", err.message);
+    }
+
     console.log("✅ Upstox session created & token saved to MongoDB.");
     
-    // Redirect back to the frontend
-    const frontendUrl = process.env.CLIENT_ORIGIN || "https://mariaalgo.online";
-    res.redirect(`${frontendUrl}?upstox=success`);
+    // 5. Success Message (NO REDIRECT TO FRONTEND)
+    res.status(200).send(`
+      <html>
+        <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+          <h1 style="color: green;">✅ Upstox Login Successful!</h1>
+          <p>The token is successfully saved in MongoDB and your backend bot is running.</p>
+          <p>You can now close this tab.</p>
+        </body>
+      </html>
+    `);
     
   } catch (error) {
     console.error("❌ Upstox Auth Error:", error.message);

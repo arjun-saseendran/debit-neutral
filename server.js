@@ -125,7 +125,7 @@ const start = async () => {
       console.log("✅ Upstox WebSocket started");
     } else {
       console.warn(
-        "⚠️ UPSTOX_ACCESS_TOKEN missing — live data disabled. Run: npm run login:upstox",
+        "⚠️ UPSTOX_ACCESS_TOKEN missing — live data disabled.",
       );
     }
 
