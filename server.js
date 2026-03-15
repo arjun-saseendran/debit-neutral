@@ -114,7 +114,7 @@ const start = async () => {
   // 2. Load token from DB into process memory
   const currentToken = await loadTokenFromDB();
 
-  const PORT = process.env.PORT || 3003;
+  const PORT = process.env.PORT || 3004;
   server.listen(PORT, async () => {
     console.log(`🚀 Debit Neutral Server · port ${PORT}`);
     await sendDebitNeutralAlert("🟢 <b>Debit Neutral Server Online ✅</b>");
