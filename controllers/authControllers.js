@@ -65,9 +65,11 @@ export const callback = async (req, res) => {
     process.env.UPSTOX_ACCESS_TOKEN = accessToken;
 
     console.log("✅ Upstox session created & token saved to MongoDB.");
-    res.status(200).send(
-      "<h1>✅ Upstox Connected!</h1><p>Access token saved. You can close this tab.</p>"
-    );
+    
+    // Redirect back to the frontend
+    const frontendUrl = process.env.CLIENT_ORIGIN || "https://mariaalgo.online";
+    res.redirect(`${frontendUrl}?upstox=success`);
+    
   } catch (error) {
     console.error("❌ Upstox Auth Error:", error.message);
     res.status(500).json({ error: "Upstox authentication failed", details: error.message });
