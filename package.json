@@ -1,0 +1,28 @@
+{
+  "name": "weekend-strangle-server",
+  "version": "1.0.0",
+  "description": "Weekend Strangle algo trading server — SENSEX, Upstox",
+  "author": "arjunsaseendran",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start":         "node server.js",
+    "dev":           "nodemon server.js",
+    "login:upstox":  "node upstoxAutoLogin.js"
+  },
+  "dependencies": {
+    "axios":           "^1.13.6",
+    "cors":            "^2.8.6",
+    "dotenv":          "^17.3.1",
+    "express":         "^5.2.1",
+    "mongoose":        "^9.2.2",
+    "node-cron":       "^4.2.1",
+    "puppeteer":       "^24.37.5",
+    "socket.io":       "^4.8.3",
+    "upstox-js-sdk":   "^2.21.0",
+    "ws":              "^8.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
