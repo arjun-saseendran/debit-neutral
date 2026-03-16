@@ -1,7 +1,13 @@
-// ─── Upstox Live Data (WebSocket) ────────────────────────────────────────────
-// Connects to Upstox WebSocket v3 market data feed.
-// Prices are stored in debitNeutralPrices{} (owned by debitNeutralEngine) via callback.
-// This service is DATA ONLY — no orders are placed here.
+// ─── Upstox Live Data ─────────────────────────────────────────────────────────
+// Two Upstox WebSocket connections initialized together:
+//
+//   1. Market Data Feed v3 (protobuf binary) → price ticks → debitNeutralPrices
+//   2. PortfolioDataStreamer (JSON text)      → order updates → waitForOrderConfirmation()
+//
+// WHY TWO:
+//   Upstox market data and order updates are separate WebSocket endpoints.
+//   Both are initialized here so the full Upstox connection lifecycle
+//   lives in one place. debitNeutralEngine never needs to know about sockets.
 //
 // ✅ FIX (2025): Switched from v2 → v3 WebSocket endpoint.
 //         Upstox permanently retired v2 (returns HTTP 410 Gone).
@@ -13,6 +19,8 @@
 import "dotenv/config";
 import { WebSocket } from "ws";
 import https from "https";
+import pkg from "upstox-js-sdk";
+const { PortfolioDataStreamer } = pkg;
 
 let ws             = null;
 let reconnectTimer = null;
@@ -37,6 +45,57 @@ export const getLastTickAge = () =>
 // Callback registered by debitNeutralEngine to receive price updates
 let _priceCallback = null;
 export const onPriceUpdate = (fn) => { _priceCallback = fn; };
+
+// ─── Order confirmation via PortfolioDataStreamer push ────────────────────────
+// Pending order promises: Map of orderId → { resolve, reject, timer }
+const _pendingOrders = new Map();
+
+// Called by debitNeutralEngine's placeAndConfirmUpstox() instead of REST polling.
+// Resolves instantly when Upstox pushes a complete/rejected update.
+// Hard timeout of 30s → falls back to REST poll in debitNeutralEngine.
+export const waitForOrderConfirmation = (orderId, timeoutMs = 30000) => {
+  return new Promise((resolve, reject) => {
+    const id = String(orderId);
+
+    const timer = setTimeout(() => {
+      _pendingOrders.delete(id);
+      reject(new Error(`Order ${id}: No confirmation from Upstox order socket in ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+
+    _pendingOrders.set(id, { resolve, reject, timer });
+  });
+};
+
+// ─── Internal: handle order update pushed by PortfolioDataStreamer ────────────
+function _handleOrderUpdate(msg) {
+  try {
+    const data  = typeof msg === "string" ? JSON.parse(msg) : msg;
+    const order = data?.data ?? data;
+    const id     = String(order?.order_id ?? "");
+    const status = (order?.status ?? "").toLowerCase();
+
+    if (!id || !_pendingOrders.has(id)) return;
+
+    if (status === "complete") {
+      const { resolve, timer } = _pendingOrders.get(id);
+      clearTimeout(timer);
+      _pendingOrders.delete(id);
+      console.log(`✅ [PortfolioStream] Order ${id} complete`);
+      resolve({ orderId: id });
+
+    } else if (status === "rejected" || status === "cancelled") {
+      const { reject, timer } = _pendingOrders.get(id);
+      clearTimeout(timer);
+      _pendingOrders.delete(id);
+      const reason = order?.status_message || status;
+      console.error(`❌ [PortfolioStream] Order ${id} ${status}: ${reason}`);
+      reject(new Error(`REJECTED: ${order?.tradingsymbol ?? id} — ${reason}`));
+    }
+    // OPEN / UPDATE / pending → Upstox will push again when final
+  } catch (e) {
+    console.warn("⚠️ [PortfolioStream] Failed to parse order update:", e.message);
+  }
+}
 
 // ─── Fetch authorised WebSocket URL from Upstox ──────────────────────────────
 const _getStreamerUrl = (token) =>
@@ -198,7 +257,35 @@ export const initUpstoxLiveData = async () => {
     console.warn("⚠️ UPSTOX_ACCESS_TOKEN missing — live data disabled");
     return;
   }
+
+  // ── 1. Market data feed (price ticks — protobuf binary) ───────────────────
   await _connect(token);
+
+  // ── 2. Portfolio order stream (order updates — JSON text) ─────────────────
+  // PortfolioDataStreamer from upstox-js-sdk uses the token already set on
+  // ApiClient.instance — no extra auth needed here.
+  console.log("🔌 Connecting Upstox PortfolioDataStreamer (order updates)...");
+  const portfolio = new PortfolioDataStreamer(true, false, false, false);
+
+  portfolio.on("open", () => {
+    console.log("✅ Upstox PortfolioDataStreamer connected — order updates live");
+  });
+
+  portfolio.on("message", (data) => {
+    const msg = data.toString("utf-8");
+    _handleOrderUpdate(msg);
+  });
+
+  portfolio.on("close", () => {
+    console.warn("⚠️ Upstox PortfolioDataStreamer closed — auto-reconnecting...");
+  });
+
+  portfolio.on("error", (err) => {
+    console.error("❌ Upstox PortfolioDataStreamer error:", err?.message ?? err);
+  });
+
+  portfolio.autoReconnect(true, 5, 20);
+  portfolio.connect();
 };
 
 const _connect = async (token) => {

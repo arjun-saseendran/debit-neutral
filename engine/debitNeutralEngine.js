@@ -74,6 +74,7 @@ import {
   onPriceUpdate,
   isFeedStale,
   getLastTickAge,
+  waitForOrderConfirmation,
 } from "../services/liveDataService.js";
 import getTradeModel               from "../models/tradeModel.js";
 import { getTradePerformanceModel } from "../models/tradePerformanceModel.js";
@@ -263,74 +264,75 @@ const placeAndConfirmUpstox = async (instrumentKey, side, qty, tag = "") => {
 
   debitNeutralLog(`📤 Order placed | ${side} ${qty}×${instrumentKey} | orderId=${orderId}`, "info");
 
+  // ── PRIMARY: PortfolioDataStreamer push ────────────────────────────────────
+  // Upstox pushes order status as JSON on the portfolio WebSocket.
+  // Resolves instantly on complete, rejects on rejected/cancelled.
+  // 30s hard timeout → falls through to REST fallback.
+  try {
+    await waitForOrderConfirmation(orderId, 30000);
+    debitNeutralLog(`✅ Confirmed via socket | ${side} ${instrumentKey} | orderId=${orderId}`, "success");
+    return orderId;
+
+  } catch (socketErr) {
+    if (socketErr.message.startsWith("REJECTED:")) throw socketErr;
+
+    // Socket timed out — fall back to REST polling
+    debitNeutralLog(
+      `⚠️ Socket timeout for ${orderId} — falling back to REST poll: ${socketErr.message}`,
+      "warn"
+    );
+    await sendDebitNeutralAlert(
+      `⚠️ <b>Order data delayed</b>\n` +
+      `Leg: <b>${tag}</b> | Side: ${side}\n` +
+      `Symbol: ${instrumentKey} | OrderId: ${orderId}\n` +
+      `Upstox socket gave no push in 30s — checking via REST every 2s\n` +
+      `⏳ Bot waiting for confirmation, position being managed`
+    );
+  }
+
+  // ── FALLBACK: REST poll — 20 attempts × 2s = 40s ─────────────────────────
   const { getUpstoxOrderApi } = await import("../config/upstoxConfig.js");
   const api = getUpstoxOrderApi();
 
-  const fetchStatus = async () => {
-    const r = await api.getOrderDetails(process.env.UPSTOX_API_VERSION || "2.0", orderId);
-    return r?.data ?? null;
-  };
-
-  // 2. Phase 1 — fast polling
-  for (let i = 0; i < PHASE1_MAX_ATTEMPTS; i++) {
-    await new Promise(r => setTimeout(r, PHASE1_POLL_MS));
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    await new Promise(r => setTimeout(r, 2000));
     try {
-      const order = await fetchStatus();
-      if (!order) { console.log(`⏳ Phase1 ${i+1}/${PHASE1_MAX_ATTEMPTS} — ${orderId} not in book yet`); continue; }
-      if (order.status === "complete") {
-        debitNeutralLog(`✅ Confirmed (phase1 attempt ${i+1}) | ${side} ${instrumentKey} | orderId=${orderId}`, "success");
-        return orderId;
-      }
-      if (order.status === "rejected")
-        throw new Error(`REJECTED: ${instrumentKey} — ${order.status_message || "broker rejected"} | orderId=${orderId}`);
-      console.log(`⏳ Phase1 ${i+1}/${PHASE1_MAX_ATTEMPTS} — ${orderId} status="${order.status}"`);
-    } catch (err) {
-      if (err.message.startsWith("REJECTED:")) throw err;
-      console.warn(`⚠️ Phase1 ${i+1}/${PHASE1_MAX_ATTEMPTS} poll error for ${instrumentKey}: ${err.message}`);
-    }
-  }
+      const r     = await api.getOrderDetails(process.env.UPSTOX_API_VERSION || "2.0", orderId);
+      const order = r?.data ?? null;
 
-  // 3. Phase 2 — infinite background retry
-  debitNeutralLog(
-    `⚠️ ${instrumentKey} (${orderId}) not confirmed in ${PHASE1_MAX_ATTEMPTS * PHASE1_POLL_MS / 1000}s` +
-    ` — entering infinite retry every ${PHASE2_POLL_MS / 1000}s. Bot BLOCKED until Upstox responds.`,
-    "warn"
-  );
-  await sendDebitNeutralAlert(
-    `⚠️ <b>Order confirmation delayed</b>\n` +
-    `Leg: <b>${tag}</b> | Side: ${side}\n` +
-    `Symbol: ${instrumentKey}\n` +
-    `OrderId: ${orderId}\n` +
-    `Retrying every ${PHASE2_POLL_MS / 1000}s — bot is <b>BLOCKED</b> until Upstox confirms.`
-  );
-
-  let attempt = 0;
-  while (true) {
-    attempt++;
-    await new Promise(r => setTimeout(r, PHASE2_POLL_MS));
-    try {
-      const order = await fetchStatus();
       if (!order) {
-        console.warn(`⚠️ BG retry ${attempt}: ${orderId} still not in order book — waiting…`);
+        console.warn(`⚠️ [REST fallback] attempt ${attempt}/20: ${orderId} not in order book yet`);
         continue;
       }
       if (order.status === "complete") {
-        debitNeutralLog(`✅ Confirmed via BG retry (attempt ${attempt}) | ${side} ${instrumentKey} | orderId=${orderId}`, "success");
+        debitNeutralLog(`✅ Confirmed via REST | ${side} ${instrumentKey} | orderId=${orderId} (attempt ${attempt})`, "success");
         await sendDebitNeutralAlert(
-          `✅ <b>Order confirmed</b> (BG retry ${attempt})\n` +
+          `✅ <b>Order confirmed via REST</b>\n` +
           `Leg: <b>${tag}</b> | Side: ${side}\n` +
-          `Symbol: ${instrumentKey} | OrderId: ${orderId}`
+          `Symbol: ${instrumentKey} | OrderId: ${orderId}\n` +
+          `(Socket timeout fallback — attempt ${attempt}/20)`
         );
         return orderId;
       }
       if (order.status === "rejected")
         throw new Error(`REJECTED: ${instrumentKey} — ${order.status_message || "broker rejected"} | orderId=${orderId}`);
-      console.warn(`⚠️ BG retry ${attempt}: ${orderId} status="${order.status}" — still waiting…`);
+
+      console.warn(`⚠️ [REST fallback] attempt ${attempt}/20: ${orderId} status="${order.status}"`);
     } catch (err) {
       if (err.message.startsWith("REJECTED:")) throw err;
-      console.warn(`⚠️ BG retry ${attempt}: API error for ${orderId} — ${err.message} — retrying in ${PHASE2_POLL_MS / 1000}s`);
+      console.warn(`⚠️ [REST fallback] attempt ${attempt}/20 error: ${err.message}`);
     }
   }
+
+  // Both socket and REST exhausted — hard stop, manual intervention required
+  await sendDebitNeutralAlert(
+    `🚨 <b>Order UNCONFIRMED — Manual Action Required</b>\n` +
+    `Leg: <b>${tag}</b> | Side: ${side}\n` +
+    `Symbol: ${instrumentKey} | OrderId: ${orderId}\n` +
+    `Socket + REST both gave no answer after ~70s\n` +
+    `⚠️ Check Upstox manually — do NOT restart bot until resolved`
+  );
+  throw new Error(`Order ${orderId} (${instrumentKey}): Unconfirmed after socket timeout + 20 REST attempts. Manual check required.`);
 };
 
 // ─── Subscribe WebSocket for all legs ────────────────────────────────────────
