@@ -47,65 +47,95 @@ let _priceCallback = null;
 export const onPriceUpdate = (fn) => { _priceCallback = fn; };
 
 // ─── Order confirmation ───────────────────────────────────────────────────────
-// TWO sources can resolve a pending order — whichever arrives first wins:
-//   1. Upstox Postback (HTTP POST to /api/orders/postback-debit) — most reliable
-//   2. Upstox PortfolioDataStreamer (WebSocket push) — backup
+// RACE CONDITION FIX:
+// Upstox postback or PortfolioDataStreamer can arrive BEFORE placeOrder()
+// returns the order_id. Solution: buffer ALL incoming updates immediately.
+// When waitForOrderConfirmation(orderId) is called after placeOrder():
+//   - Check buffer first — if update already arrived, resolve immediately
+//   - If not in buffer yet — register listener and wait for it
 //
-// Both call _resolveOrder() internally.
+// TWO sources feed into the buffer — whichever arrives first wins:
+//   1. Upstox Postback (HTTP POST to /api/orders/postback-debit) — primary
+//   2. PortfolioDataStreamer WebSocket push — backup
+//
 // Hard timeout 60s → falls back to REST poll in debitNeutralEngine.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Pending order promises: Map of orderId → { resolve, reject, timer }
+// Early arrival buffer: orderId → { status, avgPrice, reason, timestamp }
+const _earlyBuffer  = new Map();
+const BUFFER_TTL_MS = 120_000; // 2 minutes
+
+// Pending listeners: orderId → { resolve, reject, timer }
 const _pendingOrders = new Map();
 
-// ─── Internal: resolve or reject a pending order ─────────────────────────────
+// ─── Internal: process any incoming order update ──────────────────────────────
 function _resolveOrder(order, source) {
   try {
     const data   = typeof order === "string" ? JSON.parse(order) : order;
     const o      = data?.data ?? data;
     const id     = String(o?.order_id ?? "");
     const status = (o?.status ?? "").toLowerCase();
+    const avgPrice = o?.average_price ?? o?.avgPrice ?? 0;
+    const reason   = o?.status_message || status;
 
-    if (!id || !_pendingOrders.has(id)) return;
+    if (!id) return;
+    console.log(`📬 [${source}] order_id=${id} status=${status} avgPrice=${avgPrice}`);
 
-    if (status === "complete") {
-      const { resolve, timer } = _pendingOrders.get(id);
+    // ── If listener already waiting — resolve immediately ───────────────────
+    if (_pendingOrders.has(id)) {
+      const { resolve, reject, timer } = _pendingOrders.get(id);
       clearTimeout(timer);
       _pendingOrders.delete(id);
-      console.log(`✅ [${source}] Order ${id} complete`);
-      resolve({ orderId: id });
 
-    } else if (status === "rejected" || status === "cancelled") {
-      const { reject, timer } = _pendingOrders.get(id);
-      clearTimeout(timer);
-      _pendingOrders.delete(id);
-      const reason = o?.status_message || status;
-      console.error(`❌ [${source}] Order ${id} ${status}: ${reason}`);
-      reject(new Error(`REJECTED: ${o?.tradingsymbol ?? id} — ${reason}`));
+      if (status === "complete") {
+        console.log(`✅ [${source}] Order ${id} complete | avgPrice=${avgPrice}`);
+        resolve({ orderId: id, avgPrice });
+      } else if (status === "rejected" || status === "cancelled") {
+        console.error(`❌ [${source}] Order ${id} ${status}: ${reason}`);
+        reject(new Error(`REJECTED: ${o?.tradingsymbol ?? id} — ${reason}`));
+      }
+      return;
     }
-    // OPEN / UPDATE / pending → Upstox will push again when final
+
+    // ── Listener not registered yet — buffer terminal updates ───────────────
+    if (status === "complete" || status === "rejected" || status === "cancelled") {
+      _earlyBuffer.set(id, { status, avgPrice, reason, tradingsymbol: o?.tradingsymbol, timestamp: Date.now() });
+      setTimeout(() => _earlyBuffer.delete(id), BUFFER_TTL_MS);
+    }
   } catch (e) {
     console.warn(`⚠️ [${source}] Failed to parse order update:`, e.message);
   }
 }
 
 // ─── PUBLIC: called by debit-neutral server.js postback route ────────────────
-// Upstox POSTs order updates to /api/orders/postback-debit when orders fill.
-// This is the PRIMARY confirmation method — independent of WebSocket.
 export const resolveOrderFromPostback = (order) => {
-  const o  = order?.data ?? order;
-  const id = String(o?.order_id ?? "");
-  console.log(`📬 [Postback] order_id=${id} status=${o?.status}`);
   _resolveOrder(order, "Postback");
 };
 
 // ─── PUBLIC: called by debitNeutralEngine's placeAndConfirmUpstox() ──────────
-// Register BEFORE placing the order so postback/socket cannot be missed.
+// Checks buffer first — if update already arrived during placeOrder() gap,
+// resolves immediately. Otherwise registers listener for future push.
 // Hard timeout 60s → falls back to REST poll in debitNeutralEngine.
 export const waitForOrderConfirmation = (orderId, timeoutMs = 60000) => {
   return new Promise((resolve, reject) => {
     const id = String(orderId);
 
+    // ── Check early arrival buffer first ─────────────────────────────────────
+    if (_earlyBuffer.has(id)) {
+      const buffered = _earlyBuffer.get(id);
+      _earlyBuffer.delete(id);
+
+      if (buffered.status === "complete") {
+        console.log(`✅ [Buffer] Order ${id} already complete | avgPrice=${buffered.avgPrice}`);
+        resolve({ orderId: id, avgPrice: buffered.avgPrice });
+      } else {
+        console.error(`❌ [Buffer] Order ${id} already ${buffered.status}: ${buffered.reason}`);
+        reject(new Error(`REJECTED: ${buffered.tradingsymbol ?? id} — ${buffered.reason}`));
+      }
+      return;
+    }
+
+    // ── Not in buffer — register listener for future push ────────────────────
     const timer = setTimeout(() => {
       _pendingOrders.delete(id);
       reject(new Error(`Order ${id}: No confirmation from Upstox in ${timeoutMs / 1000}s (postback + socket both silent)`));
@@ -115,9 +145,8 @@ export const waitForOrderConfirmation = (orderId, timeoutMs = 60000) => {
   });
 };
 
-// ─── Internal: handle order update pushed by PortfolioDataStreamer ────────────
+// ─── Internal: handle order update from PortfolioDataStreamer ─────────────────
 // BACKUP — fires if postback didn't arrive first.
-// Both can fire safely — _resolveOrder() ignores already-resolved orders.
 function _handleOrderUpdate(msg) {
   _resolveOrder(msg, "PortfolioStream");
 }

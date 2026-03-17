@@ -241,7 +241,7 @@ const placeAndConfirmUpstox = async (instrumentKey, side, qty, tag = "") => {
   if (!LIVE()) {
     const id = `PAPER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     console.log(`📝 [PAPER] ${side} ${qty}×${instrumentKey} tag=${tag}`);
-    return id;
+    return { orderId: id, avgPrice: 0 };
   }
 
   // 1. Place order
@@ -265,18 +265,18 @@ const placeAndConfirmUpstox = async (instrumentKey, side, qty, tag = "") => {
   debitNeutralLog(`📤 Order placed | ${side} ${qty}×${instrumentKey} | orderId=${orderId}`, "info");
 
   // ── PRIMARY: Postback + PortfolioDataStreamer — whichever arrives first ──────
-  // Upstox POSTs to /api/orders/postback-debit (primary, HTTP — most reliable).
-  // PortfolioDataStreamer WebSocket push is backup.
+  // liveDataService buffers ALL incoming updates immediately.
+  // If update arrived during placeOrder() gap — resolved from buffer instantly.
+  // Returns { orderId, avgPrice } from actual Upstox fill.
   // 60s timeout → falls through to REST fallback.
   try {
-    await waitForOrderConfirmation(orderId, 60000);
-    debitNeutralLog(`✅ Confirmed | ${side} ${instrumentKey} | orderId=${orderId}`, "success");
-    return orderId;
+    const result = await waitForOrderConfirmation(orderId, 60000);
+    debitNeutralLog(`✅ Confirmed | ${side} ${instrumentKey} | orderId=${orderId} avgPrice=${result.avgPrice}`, "success");
+    return { orderId, avgPrice: result.avgPrice };
 
   } catch (confirmErr) {
     if (confirmErr.message.startsWith("REJECTED:")) throw confirmErr;
 
-    // Both postback and socket silent for 60s — fall back to REST polling
     debitNeutralLog(
       `⚠️ No postback/socket confirmation for ${orderId} in 60s — falling back to REST: ${confirmErr.message}`,
       "warn"
@@ -305,14 +305,16 @@ const placeAndConfirmUpstox = async (instrumentKey, side, qty, tag = "") => {
         continue;
       }
       if (order.status === "complete") {
-        debitNeutralLog(`✅ Confirmed via REST | ${side} ${instrumentKey} | orderId=${orderId} (attempt ${attempt})`, "success");
+        const avgPrice = order.average_price ?? 0;
+        debitNeutralLog(`✅ Confirmed via REST | ${side} ${instrumentKey} | orderId=${orderId} avgPrice=${avgPrice} (attempt ${attempt})`, "success");
         await sendDebitNeutralAlert(
           `✅ <b>Order confirmed via REST</b>\n` +
           `Leg: <b>${tag}</b> | Side: ${side}\n` +
           `Symbol: ${instrumentKey} | OrderId: ${orderId}\n` +
-          `(Socket timeout fallback — attempt ${attempt}/20)`
+          `Avg Price: ${avgPrice}\n` +
+          `(Postback timeout fallback — attempt ${attempt}/20)`
         );
-        return orderId;
+        return { orderId, avgPrice };
       }
       if (order.status === "rejected")
         throw new Error(`REJECTED: ${instrumentKey} — ${order.status_message || "broker rejected"} | orderId=${orderId}`);
@@ -324,7 +326,6 @@ const placeAndConfirmUpstox = async (instrumentKey, side, qty, tag = "") => {
     }
   }
 
-  // Both socket and REST exhausted — hard stop, manual intervention required
   await sendDebitNeutralAlert(
     `🚨 <b>Order UNCONFIRMED — Manual Action Required</b>\n` +
     `Leg: <b>${tag}</b> | Side: ${side}\n` +
@@ -396,27 +397,32 @@ export const enterDebitNeutral = async () => {
 
   debitNeutralLog("📤 Placing 4 legs — awaiting Upstox confirmation for each…", "info");
 
-  await placeAndConfirmUpstox(sel.callBuy.instrumentKey,  "BUY",  qty, "CALL_BUY");
-  debitNeutralLog(`✅ Leg 1/4 confirmed: CALL BUY  ${sel.callBuy.strike}CE`, "info");
+  const callBuyResult  = await placeAndConfirmUpstox(sel.callBuy.instrumentKey,  "BUY",  qty, "CALL_BUY");
+  debitNeutralLog(`✅ Leg 1/4 confirmed: CALL BUY  ${sel.callBuy.strike}CE @ ${callBuyResult.avgPrice}`, "info");
 
-  await placeAndConfirmUpstox(sel.putBuy.instrumentKey,   "BUY",  qty, "PUT_BUY");
-  debitNeutralLog(`✅ Leg 2/4 confirmed: PUT BUY   ${sel.putBuy.strike}PE`, "info");
+  const putBuyResult   = await placeAndConfirmUpstox(sel.putBuy.instrumentKey,   "BUY",  qty, "PUT_BUY");
+  debitNeutralLog(`✅ Leg 2/4 confirmed: PUT BUY   ${sel.putBuy.strike}PE @ ${putBuyResult.avgPrice}`, "info");
 
-  await placeAndConfirmUpstox(sel.callSell.instrumentKey, "SELL", qty, "CALL_SELL");
-  debitNeutralLog(`✅ Leg 3/4 confirmed: CALL SELL ${sel.callSell.strike}CE`, "info");
+  const callSellResult = await placeAndConfirmUpstox(sel.callSell.instrumentKey, "SELL", qty, "CALL_SELL");
+  debitNeutralLog(`✅ Leg 3/4 confirmed: CALL SELL ${sel.callSell.strike}CE @ ${callSellResult.avgPrice}`, "info");
 
-  await placeAndConfirmUpstox(sel.putSell.instrumentKey,  "SELL", qty, "PUT_SELL");
-  debitNeutralLog(`✅ Leg 4/4 confirmed: PUT SELL  ${sel.putSell.strike}PE`, "info");
+  const putSellResult  = await placeAndConfirmUpstox(sel.putSell.instrumentKey,  "SELL", qty, "PUT_SELL");
+  debitNeutralLog(`✅ Leg 4/4 confirmed: PUT SELL  ${sel.putSell.strike}PE @ ${putSellResult.avgPrice}`, "info");
 
-  const totalPremiumPaid =
-    (sel.callBuy.ltp + sel.putBuy.ltp - sel.callSell.ltp - sel.putSell.ltp) * qty;
+  // Use actual fill prices from Upstox — not LTP estimates from option chain
+  const actualCallBuy  = callBuyResult.avgPrice  || sel.callBuy.ltp;
+  const actualPutBuy   = putBuyResult.avgPrice   || sel.putBuy.ltp;
+  const actualCallSell = callSellResult.avgPrice || sel.callSell.ltp;
+  const actualPutSell  = putSellResult.avgPrice  || sel.putSell.ltp;
+
+  const totalPremiumPaid = (actualCallBuy + actualPutBuy - actualCallSell - actualPutSell) * qty;
 
   const trade = await Trade.create({
     index: "SENSEX", status: "ACTIVE", quantity: qty, expiry,
     instrumentKeys: { callBuy: sel.callBuy.instrumentKey, callSell: sel.callSell.instrumentKey, putBuy: sel.putBuy.instrumentKey, putSell: sel.putSell.instrumentKey },
     symbols:        { callBuy: sel.callBuy.tradingsymbol,  callSell: sel.callSell.tradingsymbol,  putBuy: sel.putBuy.tradingsymbol,  putSell: sel.putSell.tradingsymbol  },
     strikes:        { callBuy: sel.callBuy.strike,         callSell: sel.callSell.strike,         putBuy: sel.putBuy.strike,         putSell: sel.putSell.strike         },
-    entryPremiums:  { callBuy: sel.callBuy.ltp,            callSell: sel.callSell.ltp,            putBuy: sel.putBuy.ltp,            putSell: sel.putSell.ltp            },
+    entryPremiums:  { callBuy: actualCallBuy, callSell: actualCallSell, putBuy: actualPutBuy, putSell: actualPutSell },
     totalPremiumPaid,
     legsAlive: { callBuy: true, callSell: true, putBuy: true, putSell: true },
     lockedProfit: 0, peakProfit: 0, trailActive: false,
@@ -425,10 +431,10 @@ export const enterDebitNeutral = async () => {
   await sendDebitNeutralAlert(
     `🟢 <b>Debit Neutral ENTERED — All 4 legs confirmed by Upstox</b>\n` +
     `Expiry: ${expiry}\n` +
-    `CallBuy:  ${sel.callBuy.strike}CE  Δ${sel.callBuy.delta.toFixed(2)}  ₹${sel.callBuy.ltp}\n` +
-    `CallSell: ${sel.callSell.strike}CE  Δ${sel.callSell.delta.toFixed(2)}  ₹${sel.callSell.ltp}\n` +
-    `PutBuy:   ${sel.putBuy.strike}PE  Δ${sel.putBuy.delta.toFixed(2)}  ₹${sel.putBuy.ltp}\n` +
-    `PutSell:  ${sel.putSell.strike}PE  Δ${sel.putSell.delta.toFixed(2)}  ₹${sel.putSell.ltp}\n` +
+    `CallBuy:  ${sel.callBuy.strike}CE  @ ₹${actualCallBuy.toFixed(2)} (est ₹${sel.callBuy.ltp})\n` +
+    `CallSell: ${sel.callSell.strike}CE  @ ₹${actualCallSell.toFixed(2)} (est ₹${sel.callSell.ltp})\n` +
+    `PutBuy:   ${sel.putBuy.strike}PE  @ ₹${actualPutBuy.toFixed(2)} (est ₹${sel.putBuy.ltp})\n` +
+    `PutSell:  ${sel.putSell.strike}PE  @ ₹${actualPutSell.toFixed(2)} (est ₹${sel.putSell.ltp})\n` +
     `Net debit: ₹${totalPremiumPaid.toFixed(2)} | Qty: ${qty} | Exit: Monday 3:20 PM`
   );
   debitNeutralLog(`🟢 ENTERED SENSEX | expiry=${expiry} | qty=${qty} | netDebit=₹${totalPremiumPaid.toFixed(2)}`, "success");
