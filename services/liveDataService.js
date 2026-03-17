@@ -46,33 +46,25 @@ export const getLastTickAge = () =>
 let _priceCallback = null;
 export const onPriceUpdate = (fn) => { _priceCallback = fn; };
 
-// ─── Order confirmation via PortfolioDataStreamer push ────────────────────────
+// ─── Order confirmation ───────────────────────────────────────────────────────
+// TWO sources can resolve a pending order — whichever arrives first wins:
+//   1. Upstox Postback (HTTP POST to /api/orders/postback-debit) — most reliable
+//   2. Upstox PortfolioDataStreamer (WebSocket push) — backup
+//
+// Both call _resolveOrder() internally.
+// Hard timeout 60s → falls back to REST poll in debitNeutralEngine.
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Pending order promises: Map of orderId → { resolve, reject, timer }
 const _pendingOrders = new Map();
 
-// Called by debitNeutralEngine's placeAndConfirmUpstox() instead of REST polling.
-// Resolves instantly when Upstox pushes a complete/rejected update.
-// Hard timeout of 30s → falls back to REST poll in debitNeutralEngine.
-export const waitForOrderConfirmation = (orderId, timeoutMs = 30000) => {
-  return new Promise((resolve, reject) => {
-    const id = String(orderId);
-
-    const timer = setTimeout(() => {
-      _pendingOrders.delete(id);
-      reject(new Error(`Order ${id}: No confirmation from Upstox order socket in ${timeoutMs / 1000}s`));
-    }, timeoutMs);
-
-    _pendingOrders.set(id, { resolve, reject, timer });
-  });
-};
-
-// ─── Internal: handle order update pushed by PortfolioDataStreamer ────────────
-function _handleOrderUpdate(msg) {
+// ─── Internal: resolve or reject a pending order ─────────────────────────────
+function _resolveOrder(order, source) {
   try {
-    const data  = typeof msg === "string" ? JSON.parse(msg) : msg;
-    const order = data?.data ?? data;
-    const id     = String(order?.order_id ?? "");
-    const status = (order?.status ?? "").toLowerCase();
+    const data   = typeof order === "string" ? JSON.parse(order) : order;
+    const o      = data?.data ?? data;
+    const id     = String(o?.order_id ?? "");
+    const status = (o?.status ?? "").toLowerCase();
 
     if (!id || !_pendingOrders.has(id)) return;
 
@@ -80,21 +72,54 @@ function _handleOrderUpdate(msg) {
       const { resolve, timer } = _pendingOrders.get(id);
       clearTimeout(timer);
       _pendingOrders.delete(id);
-      console.log(`✅ [PortfolioStream] Order ${id} complete`);
+      console.log(`✅ [${source}] Order ${id} complete`);
       resolve({ orderId: id });
 
     } else if (status === "rejected" || status === "cancelled") {
       const { reject, timer } = _pendingOrders.get(id);
       clearTimeout(timer);
       _pendingOrders.delete(id);
-      const reason = order?.status_message || status;
-      console.error(`❌ [PortfolioStream] Order ${id} ${status}: ${reason}`);
-      reject(new Error(`REJECTED: ${order?.tradingsymbol ?? id} — ${reason}`));
+      const reason = o?.status_message || status;
+      console.error(`❌ [${source}] Order ${id} ${status}: ${reason}`);
+      reject(new Error(`REJECTED: ${o?.tradingsymbol ?? id} — ${reason}`));
     }
     // OPEN / UPDATE / pending → Upstox will push again when final
   } catch (e) {
-    console.warn("⚠️ [PortfolioStream] Failed to parse order update:", e.message);
+    console.warn(`⚠️ [${source}] Failed to parse order update:`, e.message);
   }
+}
+
+// ─── PUBLIC: called by debit-neutral server.js postback route ────────────────
+// Upstox POSTs order updates to /api/orders/postback-debit when orders fill.
+// This is the PRIMARY confirmation method — independent of WebSocket.
+export const resolveOrderFromPostback = (order) => {
+  const o  = order?.data ?? order;
+  const id = String(o?.order_id ?? "");
+  console.log(`📬 [Postback] order_id=${id} status=${o?.status}`);
+  _resolveOrder(order, "Postback");
+};
+
+// ─── PUBLIC: called by debitNeutralEngine's placeAndConfirmUpstox() ──────────
+// Register BEFORE placing the order so postback/socket cannot be missed.
+// Hard timeout 60s → falls back to REST poll in debitNeutralEngine.
+export const waitForOrderConfirmation = (orderId, timeoutMs = 60000) => {
+  return new Promise((resolve, reject) => {
+    const id = String(orderId);
+
+    const timer = setTimeout(() => {
+      _pendingOrders.delete(id);
+      reject(new Error(`Order ${id}: No confirmation from Upstox in ${timeoutMs / 1000}s (postback + socket both silent)`));
+    }, timeoutMs);
+
+    _pendingOrders.set(id, { resolve, reject, timer });
+  });
+};
+
+// ─── Internal: handle order update pushed by PortfolioDataStreamer ────────────
+// BACKUP — fires if postback didn't arrive first.
+// Both can fire safely — _resolveOrder() ignores already-resolved orders.
+function _handleOrderUpdate(msg) {
+  _resolveOrder(msg, "PortfolioStream");
 }
 
 // ─── Fetch authorised WebSocket URL from Upstox ──────────────────────────────

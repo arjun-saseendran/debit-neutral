@@ -264,28 +264,28 @@ const placeAndConfirmUpstox = async (instrumentKey, side, qty, tag = "") => {
 
   debitNeutralLog(`📤 Order placed | ${side} ${qty}×${instrumentKey} | orderId=${orderId}`, "info");
 
-  // ── PRIMARY: PortfolioDataStreamer push ────────────────────────────────────
-  // Upstox pushes order status as JSON on the portfolio WebSocket.
-  // Resolves instantly on complete, rejects on rejected/cancelled.
-  // 30s hard timeout → falls through to REST fallback.
+  // ── PRIMARY: Postback + PortfolioDataStreamer — whichever arrives first ──────
+  // Upstox POSTs to /api/orders/postback-debit (primary, HTTP — most reliable).
+  // PortfolioDataStreamer WebSocket push is backup.
+  // 60s timeout → falls through to REST fallback.
   try {
-    await waitForOrderConfirmation(orderId, 30000);
-    debitNeutralLog(`✅ Confirmed via socket | ${side} ${instrumentKey} | orderId=${orderId}`, "success");
+    await waitForOrderConfirmation(orderId, 60000);
+    debitNeutralLog(`✅ Confirmed | ${side} ${instrumentKey} | orderId=${orderId}`, "success");
     return orderId;
 
-  } catch (socketErr) {
-    if (socketErr.message.startsWith("REJECTED:")) throw socketErr;
+  } catch (confirmErr) {
+    if (confirmErr.message.startsWith("REJECTED:")) throw confirmErr;
 
-    // Socket timed out — fall back to REST polling
+    // Both postback and socket silent for 60s — fall back to REST polling
     debitNeutralLog(
-      `⚠️ Socket timeout for ${orderId} — falling back to REST poll: ${socketErr.message}`,
+      `⚠️ No postback/socket confirmation for ${orderId} in 60s — falling back to REST: ${confirmErr.message}`,
       "warn"
     );
     await sendDebitNeutralAlert(
-      `⚠️ <b>Order data delayed</b>\n` +
+      `⚠️ <b>Order confirmation delayed</b>\n` +
       `Leg: <b>${tag}</b> | Side: ${side}\n` +
       `Symbol: ${instrumentKey} | OrderId: ${orderId}\n` +
-      `Upstox socket gave no push in 30s — checking via REST every 2s\n` +
+      `Postback + WebSocket both silent for 60s — checking via REST every 2s\n` +
       `⏳ Bot waiting for confirmation, position being managed`
     );
   }

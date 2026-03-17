@@ -19,7 +19,7 @@ import authRoutes from './routes/authRoutes.js'
 
 // ─── Services ─────────────────────────────────────────────────────────────────
 import { sendDebitNeutralAlert } from "./services/telegramService.js";
-import { initUpstoxLiveData } from "./services/liveDataService.js";
+import { initUpstoxLiveData, resolveOrderFromPostback } from "./services/liveDataService.js";
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 import {
@@ -66,6 +66,26 @@ io.on("connection", (socket) => {
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use("/api/debit-neutral", debitNeutralRoutes);
 app.use("/api/auth", authRoutes);
+
+// ─── Upstox Postback — order fill confirmation ────────────────────────────────
+// Upstox POSTs order status updates here when orders fill, reject, or cancel.
+// Set this URL in Upstox developer console → App Settings → Postback URL:
+//   https://api.mariaalgo.online/api/orders/postback-debit
+//
+// PRIMARY order confirmation method — independent of WebSocket connection.
+// PortfolioDataStreamer WebSocket remains as backup — whichever arrives first wins.
+// Always respond 200 immediately so Upstox does not retry the postback.
+app.post("/api/orders/postback-debit", (req, res) => {
+  res.sendStatus(200); // respond immediately — Upstox retries if no 200
+  try {
+    const order = req.body;
+    if (order) {
+      resolveOrderFromPostback(order);
+    }
+  } catch (err) {
+    console.error("❌ Postback handler error:", err.message);
+  }
+});
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get("/status", (_req, res) =>
