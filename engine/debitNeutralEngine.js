@@ -379,7 +379,14 @@ const getLivePnL = (trade) => {
 };
 
 // ─── ENTRY ────────────────────────────────────────────────────────────────────
+// ─── Entry in-flight lock — prevents duplicate calls from dashboard ───────────
+let _entryInFlight = false;
+
 export const enterDebitNeutral = async () => {
+  if (_entryInFlight) throw new Error("Entry already in progress — please wait");
+  _entryInFlight = true;
+
+  try {
   const Trade = getTradeModel();
   const existing = await Trade.findOne({ status: { $in: ["ACTIVE", "EXITING"] } });
   if (existing) throw new Error("Active debit neutral already exists — exit first");
@@ -441,6 +448,9 @@ export const enterDebitNeutral = async () => {
   );
   debitNeutralLog(`🟢 ENTERED SENSEX | expiry=${expiry} | qty=${qty} | netDebit=₹${totalPremiumPaid.toFixed(2)}`, "success");
   return trade;
+  } finally {
+    _entryInFlight = false; // 🔓 always release lock
+  }
 };
 
 // ─── Single leg exit ──────────────────────────────────────────────────────────
