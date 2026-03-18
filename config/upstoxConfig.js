@@ -240,33 +240,50 @@ export const getOptionChain = async (instrumentKey, expiryDate) => {
 
 // =============================
 // 🛒 PLACE ORDER
+// ✅ FIX: Replaced upstox-js-sdk's api.placeOrder() with direct fetch.
+//         SDK internally calls both .end() and .then() on the same superagent
+//         request causing "Error: .end() was called twice" crash.
+//         Direct fetch is reliable and not affected by SDK bugs.
 // =============================
 export const placeOrder = async (orderData) => {
   try {
-    const api  = getUpstoxOrderApi();
-    const body = new PlaceOrderRequest(
-      orderData.qty,
-      orderData.product      || "I",
-      orderData.validity     || "DAY",
-      orderData.price        || 0,
-      orderData.tag          || "mariaalgo",
-      orderData.instrumentToken,
-      orderData.orderType    || "MARKET",
-      orderData.side,
-      orderData.disclosedQty || 0,
-      orderData.triggerPrice || 0,
-      orderData.isAmo        || false,
-    );
+    const tok = process.env.UPSTOX_ACCESS_TOKEN;
+    if (!tok) throw new Error("UPSTOX_ACCESS_TOKEN not set");
 
-    const response = await api.placeOrder(body, process.env.UPSTOX_API_VERSION || "2.0");
+    const body = {
+      quantity:          orderData.qty,
+      product:           orderData.product      || "I",
+      validity:          orderData.validity      || "DAY",
+      price:             orderData.price         || 0,
+      tag:               orderData.tag           || "mariaalgo",
+      instrument_token:  orderData.instrumentToken,
+      order_type:        orderData.orderType     || "MARKET",
+      transaction_type:  orderData.side,
+      disclosed_quantity: orderData.disclosedQty || 0,
+      trigger_price:     orderData.triggerPrice  || 0,
+      is_amo:            orderData.isAmo         || false,
+    };
 
-    if (response?.status === "success") {
-      console.log(`✅ Upstox Order Placed: ${response.data.order_id}`);
+    const res = await fetch("https://api.upstox.com/v2/order/place", {
+      method:  "POST",
+      headers: {
+        "Authorization": `Bearer ${tok}`,
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "Api-Version":   "2.0",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const json = await res.json();
+
+    if (json?.status === "success") {
+      console.log(`✅ Upstox Order Placed: ${json.data?.order_id}`);
     } else {
-      console.error(`❌ Upstox Order Rejected:`, response);
+      console.error(`❌ Upstox Order Rejected:`, json);
     }
 
-    return response;
+    return json;
   } catch (error) {
     console.error("❌ Upstox Order Error:", error.message);
     throw error;
