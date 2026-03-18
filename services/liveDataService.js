@@ -338,7 +338,12 @@ export const initUpstoxLiveData = async () => {
     console.error("❌ Upstox PortfolioDataStreamer error:", err?.message ?? err);
   });
 
-  portfolio.autoReconnect(true, 5, 20);
+  // ✅ FIX: autoReconnect disabled — upstox-js-sdk v2.22.0 has a bug where
+  // clearSubscriptions() is called on reconnect but doesn't exist, causing
+  // an infinite crash loop. Since postback webhook is now the PRIMARY order
+  // confirmation method, PortfolioDataStreamer is backup only — losing
+  // auto-reconnect is acceptable. Manual reconnect handled by server restart.
+  portfolio.autoReconnect(false, 0, 0);
   portfolio.connect();
 };
 
