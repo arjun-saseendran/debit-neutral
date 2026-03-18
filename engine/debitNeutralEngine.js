@@ -145,15 +145,17 @@ const getSensexSpot = async () => {
 };
 
 // ─── Next Friday expiry ───────────────────────────────────────────────────────
+// ✅ FIX: SENSEX weekly options now expire on THURSDAY (day 4), not Friday (day 5).
+// BSE changed expiry day — updated from getNextFridayExpiry to getNextThursdayExpiry.
 export const getNextFridayExpiry = () => {
   const now = new Date();
   const ist = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
   for (let d = 0; d <= 7; d++) {
     const dt = new Date(ist);
     dt.setUTCDate(ist.getUTCDate() + d);
-    if (dt.getUTCDay() === 5) return dt.toISOString().split("T")[0];
+    if (dt.getUTCDay() === 4) return dt.toISOString().split("T")[0]; // Thursday
   }
-  throw new Error("Cannot find next Friday expiry");
+  throw new Error("Cannot find next Thursday expiry");
 };
 
 // ─── Delta-based strike selection ────────────────────────────────────────────
