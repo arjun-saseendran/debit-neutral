@@ -186,7 +186,7 @@ export const selectDeltaStrikes = async (expiry) => {
         instrumentKey: callKey,
         tradingsymbol: row.call_options?.tradingsymbol,
         ltp:           row.call_options?.market_data?.ltp || 0,
-        delta: callGreek?.delta ?? row.call_options?.option_greeks?.delta ?? 0,
+        delta: Math.abs(callGreek?.delta ?? row.call_options?.option_greeks?.delta ?? 0),
       },
       put: {
         instrumentKey: putKey,
@@ -202,8 +202,8 @@ export const selectDeltaStrikes = async (expiry) => {
   const callBuyRow = rows.reduce((b, r) => r.call.delta > 0 && Math.abs(r.call.delta - 0.50) < Math.abs(b.call.delta - 0.50) ? r : b);
   const putBuyRow  = rows.reduce((b, r) => r.put.delta  > 0 && Math.abs(r.put.delta  - 0.50) < Math.abs(b.put.delta  - 0.50) ? r : b);
 
-  const callSellCandidates = rows.filter(r => r.strike > callBuyRow.strike && r.call.delta > 0);
-  const putSellCandidates  = rows.filter(r => r.strike < putBuyRow.strike  && r.put.delta  > 0);
+  const callSellCandidates = rows.filter(r => r.strike > callBuyRow.strike && Math.abs(r.call.delta) > 0);
+  const putSellCandidates  = rows.filter(r => r.strike < putBuyRow.strike  && Math.abs(r.put.delta)  > 0);
 
   if (!callSellCandidates.length) throw new Error("No call sell candidates OTM of call buy");
   if (!putSellCandidates.length)  throw new Error("No put sell candidates OTM of put buy");
@@ -714,7 +714,6 @@ export const debitNeutralAutoEnter = async () => {
   try {
     await enterDebitNeutral();
   } catch (err) {
-    _entryAttempted = false;
     debitNeutralLog(`❌ Auto entry failed: ${err.message}`, "error");
     await sendDebitNeutralAlert(`❌ <b>Debit Neutral auto-entry failed</b>\n${err.message}`);
   }
